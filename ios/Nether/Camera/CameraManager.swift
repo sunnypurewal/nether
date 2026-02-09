@@ -1,41 +1,17 @@
 import SwiftUI
 import AVFoundation
 import Combine
+import ImageIO
 
-struct CameraPreview: UIViewRepresentable {
-    @ObservedObject var cameraManager: CameraManager
-
-    func makeUIView(context: Context) -> PreviewView {
-        let view = PreviewView()
-        view.videoPreviewLayer.session = cameraManager.session
-        view.videoPreviewLayer.videoGravity = .resizeAspectFill
-        return view
-    }
-
-    func updateUIView(_ uiView: PreviewView, context: Context) {
-        if let connection = uiView.videoPreviewLayer.connection {
-            if connection.isVideoOrientationSupported {
-                connection.videoOrientation = cameraManager.videoOrientation
-            }
-        }
-    }
-}
-
-class PreviewView: UIView {
-    override class var layerClass: AnyClass {
-        return AVCaptureVideoPreviewLayer.self
-    }
-    
-    var videoPreviewLayer: AVCaptureVideoPreviewLayer {
-        return layer as! AVCaptureVideoPreviewLayer
-    }
-}
-
+/// Manages the camera session, device selection, and orientation tracking.
 class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     @Published var session = AVCaptureSession()
-    @Published var videoOrientation: AVCaptureVideoOrientation = .portrait
+    @Published var frameOrientation: CGImagePropertyOrientation = .up
     @Published var currentDevice: AVCaptureDevice?
+
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservation: NSKeyValueObservation?
 
     var currentCameraLabel: String {
         guard let device = currentDevice else { return "1x" }
@@ -45,8 +21,6 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
         case .builtInWideAngleCamera:
             return "1x"
         case .builtInTelephotoCamera:
-            // This is a simplification; actual optical zoom varies by device, 
-            // but for UI labels, 2x/3x are the standard conventions.
             return "2x"
         default:
             return "1x"
@@ -58,9 +32,9 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     override init() {
         super.init()
         checkPermission()
-        setupOrientationTracking()
     }
 
+    /// Switches between available back cameras (e.g., Ultra Wide, Wide, Telephoto).
     func switchCamera() {
         let discoverySession = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInUltraWideCamera, .builtInWideAngleCamera, .builtInTelephotoCamera],
@@ -85,6 +59,7 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
             if session.canAddInput(nextInput) {
                 session.addInput(nextInput)
                 self.currentDevice = nextDevice
+                setupRotationCoordinator(for: nextDevice)
             }
         } catch {
             print("Error switching camera: \(error)")
@@ -92,34 +67,40 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
         session.commitConfiguration()
     }
 
+    /// AVCaptureVideoDataOutputSampleBufferDelegate method called when a new video frame is captured.
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         onFrameUpdate?(pixelBuffer)
     }
 
-    private func setupOrientationTracking() {
-        updateOrientation()
-        NotificationCenter.default.addObserver(forName: UIDevice.orientationDidChangeNotification, object: nil, queue: .main) { _ in
-            self.updateOrientation()
+    private func setupRotationCoordinator(for device: AVCaptureDevice) {
+        let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: nil)
+        self.rotationCoordinator = coordinator
+        
+        rotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelCapture, options: [.initial, .new]) { [weak self] coordinator, _ in
+            let angle = coordinator.videoRotationAngleForHorizonLevelCapture
+            DispatchQueue.main.async {
+                self?.updateRotationAngle(angle)
+            }
         }
     }
 
-    private func updateOrientation() {
-        let deviceOrientation = UIDevice.current.orientation
-        switch deviceOrientation {
-        case .portrait:
-            videoOrientation = .portrait
-        case .landscapeLeft:
-            videoOrientation = .landscapeRight
-        case .landscapeRight:
-            videoOrientation = .landscapeLeft
-        case .portraitUpsideDown:
-            videoOrientation = .portraitUpsideDown
-        default:
-            break
+    private func updateRotationAngle(_ angle: CGFloat) {
+        session.beginConfiguration()
+        for output in session.outputs {
+            if let connection = output.connection(with: .video) {
+                if connection.isVideoRotationAngleSupported(angle) {
+                    connection.videoRotationAngle = angle
+                }
+            }
         }
+        session.commitConfiguration()
+        
+        // Since we rotate the connection, the buffer is now upright.
+        self.frameOrientation = .up
     }
     
+    /// Checks for camera permissions and sets up the session if authorized.
     func checkPermission() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
@@ -137,10 +118,10 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
         }
     }
     
+    /// Configures and starts the AVCaptureSession.
     func setupSession() {
         session.beginConfiguration()
         
-        // Prefer the ultra-wide camera (0.5x) if available, otherwise fallback to wide-angle.
         let device = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) ??
                      AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
         
@@ -168,6 +149,8 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
             }
             
             session.commitConfiguration()
+            
+            setupRotationCoordinator(for: device)
             
             DispatchQueue.global(qos: .userInitiated).async {
                 self.session.startRunning()

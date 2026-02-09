@@ -8,6 +8,7 @@
 import SwiftUI
 import AVFoundation
 
+/// The entry point of the Nether application.
 @main
 struct NetherApp: App {
     init() {
